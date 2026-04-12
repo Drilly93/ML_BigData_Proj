@@ -1,0 +1,2 @@
+Lien vers le dataset :
+https://business.yelp.com/external-assets/files/Yelp-JSON.zip
