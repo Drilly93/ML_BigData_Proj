@@ -6,7 +6,7 @@ import time
 import matplotlib.pyplot as plt
 
 print("1. Chargement optimisé du fichier JSON (en ignorant le texte lourd)...")
-chemin_fichier = "/content/drive/.shortcut-targets-by-id/1_GN22rAl0NFIidfddFsX0Smnr9phjqN6/data/yelp_academic_dataset_review.json"# <-- À CHANGER
+chemin_fichier = r"c:\Users\USER\Documents\data\Yelp-JSON\Yelp JSON\yelp_dataset\yelp_academic_dataset_review.json"
 
 start_time = time.time()
 
@@ -31,8 +31,8 @@ print(f"Nombre total d'interactions trouvées : {len(df_brut)}")
 
 print("1. Isolation du Top 10k Utilisateurs et Top 10k Articles...")
 # On compte et on garde les index des 10 000 plus fréquents
-top_users = df_brut['user_id'].value_counts().nlargest(2000).index
-top_items = df_brut['business_id'].value_counts().nlargest(2000).index
+top_users = df_brut['user_id'].value_counts().index
+top_items = df_brut['business_id'].value_counts().index
 
 # On filtre le dataset
 df_elite = df_brut[df_brut['user_id'].isin(top_users) & df_brut['business_id'].isin(top_items)].copy()
