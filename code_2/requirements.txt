@@ -12,3 +12,6 @@ pandas>=2.0.0
 
 # Optionnel : Gestion des variables d'environnement si tu veux éviter de les coder en dur
 python-dotenv
+
+
+psutil

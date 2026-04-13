@@ -1,175 +1,173 @@
+import numpy as np
 from pyspark.sql import DataFrame
 import pyspark.sql.functions as F
-from pyspark.ml.feature import StringIndexer, StringIndexerModel
-from typing import Tuple, Dict
+from typing import Tuple
+from pyspark.broadcast import Broadcast
 
 class PySpark_eALS:
     """
     Implémentation distribuée et optimisée de l'algorithme eALS (element-wise Alternating Least Squares)
-    pour la recommandation avec feedback implicite, adaptée de (He et al., SIGIR 2016)[cite: 3, 6, 8, 17].
+    pour la recommandation avec feedback implicite.
     """
 
-    def __init__(self, K: int = 128, lambda_reg: float = 0.01, c0: float = 512.0, alpha: float = 0.4):
+    def __init__(self, K: int = 128, lambda_reg: float = 0.01, c0: float = 512.0, alpha: float = 0.4, max_iter: int = 10):
         """
-        Initialise les hyperparamètres du modèle eALS[cite: 180, 181, 488].
+        Initialise les hyperparamètres du modèle eALS. 
+        Les valeurs par défaut (c0=512, alpha=0.4, K=128) correspondent aux paramètres 
+        optimaux trouvés pour le dataset Yelp dans l'article de recherche d'origine[cite: 488, 526].
 
         Args:
-            K (int): Nombre de facteurs latents (dimensionnalité).
-            lambda_reg (float): Paramètre de régularisation L2 pour éviter le surapprentissage[cite: 106, 109].
-            c0 (float): Poids global accordé aux données manquantes (feedback négatif)[cite: 178, 180, 488].
-            alpha (float): Exposant contrôlant la distribution du poids selon la popularité des items[cite: 178, 181, 488].
+            K (int): Dimensionnalité des facteurs latents.
+            lambda_reg (float): Régularisation L2 pour prévenir le surapprentissage[cite: 106, 109].
+            c0 (float): Poids global pour les données manquantes (feedback négatif)[cite: 180].
+            alpha (float): Exposant pour pondérer les items selon leur popularité[cite: 181].
+            max_iter (int): Nombre maximum d'itérations pour l'entraînement.
         """
         self.K = K
         self.lambda_reg = lambda_reg
         self.c0 = c0
         self.alpha = alpha
-        
-        # Modèles d'indexation pour pouvoir faire la correspondance inverse (ID Entier -> String)
-        self.indexer_models: Dict[str, StringIndexerModel] = {}
+        self.max_iter = max_iter
 
-    def _filter_interactions(self, df: DataFrame, min_interactions: int) -> DataFrame:
+        # Réservation de l'espace pour les futures matrices latentes distribuées
+        self.P: DataFrame = None  # Matrice des utilisateurs
+        self.Q: DataFrame = None  # Matrice des items
+        broadcast_Sq: Broadcast = None
+        broadcast_Sp: Broadcast = None
+    def init_latent_factors(self, df_interactions: DataFrame) -> Tuple[DataFrame, DataFrame]:
         """
-        Filtre itérativement le DataFrame pour ne garder que les utilisateurs et les items 
-        ayant au moins `min_interactions` interactions[cite: 344, 345, 346, 302].
-        
-        Cette méthode tourne en boucle jusqu'à ce que la taille du DataFrame se stabilise, 
-        car la suppression d'un item peu populaire peut rendre un utilisateur inactif, et vice-versa.
+        Génère les matrices P et Q initiales à partir de la matrice d'interactions.
+        Les facteurs sont initialisés avec de très petites valeurs aléatoires pour 
+        casser la symétrie sans faire exploser les gradients.
 
         Args:
-            df (DataFrame): Le DataFrame brut contenant "user_id" et "business_id".
-            min_interactions (int): Le seuil minimum d'interactions requis.
+            df_interactions (DataFrame): Matrice contenant au moins "user_idx" et "item_idx".
 
         Returns:
-            DataFrame: Le DataFrame filtré de son bruit (k-core filtering).
+            Tuple[DataFrame, DataFrame]: Les DataFrames P et Q mis en cache et partitionnés.
         """
-        # Mise en cache initiale pour accélérer le premier comptage
-        df.cache()
-        current_count = df.count()
-        previous_count = -1
-        iteration = 1
+        print(f"--- Initialisation des matrices P et Q (K={self.K}) ---")
 
-        print(f"--- Début du filtrage (Seuil: {min_interactions}) ---")
+        # OPTIMISATION MAJEURE : Création d'une expression SQL native.
+        # Plutôt que d'utiliser une UDF Python lente, on demande au moteur Spark (Tungsten)
+        # de créer un tableau (Array) de K valeurs aléatoires (multipliées par 0.01 pour rester petites).
+        random_vector_expr = F.array([F.rand() * 0.01 for _ in range(self.K)])
+
+        # -------------------------------------------------------------------
+        # 1. Initialisation de la Matrice P (Utilisateurs)
+        # -------------------------------------------------------------------
+        print("Génération de P...")
+        # On extrait la liste exhaustive des utilisateurs
+        df_users = df_interactions.select("user_idx").distinct()
         
-        while current_count != previous_count:
-            previous_count = current_count
+        # On ajoute le vecteur latent généré nativement
+        self.P = df_users.withColumn("factors", random_vector_expr)
+        
+        # OPTIMISATION RÉSEAU : Le repartitionnement par "user_idx" garantit que 
+        # toutes les données d'un même utilisateur vivront sur le même processeur,
+        # évitant ainsi les "shuffles" destructeurs de performances lors de l'entraînement.
+        self.P = self.P.repartition("user_idx").cache()
+        num_users = self.P.count() # Force la matérialisation du cache
+        print(f"-> Matrice P initialisée et mise en cache pour {num_users} utilisateurs.")
 
-            # 1. Filtrer les utilisateurs
-            user_counts = df.groupBy("user_id").agg(F.count("*").alias("u_count"))
-            valid_users = user_counts.filter(F.col("u_count") >= min_interactions).select("user_id")
-            df = df.join(valid_users, on="user_id", how="inner")
+        # -------------------------------------------------------------------
+        # 2. Initialisation de la Matrice Q (Items)
+        # -------------------------------------------------------------------
+        print("Génération de Q...")
+        df_items = df_interactions.select("item_idx").distinct()
+        
+        self.Q = df_items.withColumn("factors", random_vector_expr)
+        
+        self.Q = self.Q.repartition("item_idx").cache()
+        num_items = self.Q.count() # Force la matérialisation du cache
+        print(f"-> Matrice Q initialisée et mise en cache pour {num_items} items.")
 
-            # 2. Filtrer les items
-            item_counts = df.groupBy("business_id").agg(F.count("*").alias("i_count"))
-            valid_items = item_counts.filter(F.col("i_count") >= min_interactions).select("business_id")
-            df = df.join(valid_items, on="business_id", how="inner")
+        return self.P, self.Q
+    
+    
+    def _compute_item_confidences(self, df_popularity: DataFrame) -> DataFrame:
+        """
+        Étape 3A : Calcule la confiance c_i pour chaque item basée sur sa popularité.
+        Formule : c_i = c0 * (f_i^alpha / sum(f_j^alpha))
+        """
+        print("--- Précalcul des poids de confiance c_i ---")
+        
+        # 1. Calculer f_i^alpha
+        df_pop_alpha = df_popularity.withColumn("f_i_alpha", F.pow("f_i", self.alpha))
+        
+        # 2. Récupérer la somme totale (action scalaire qui remonte au Driver)
+        sum_f_alpha = df_pop_alpha.select(F.sum("f_i_alpha")).collect()[0][0]
+        
+        # 3. Calculer le c_i final
+        df_c_i = df_pop_alpha.withColumn(
+            "c_i", 
+            (F.col("f_i_alpha") / F.lit(sum_f_alpha)) * F.lit(self.c0)
+        ).select("item_idx", "c_i")
+        
+        # On met ce petit DataFrame en cache, car il sera utilisé à CHAQUE itération
+        df_c_i.cache()
+        df_c_i.count() # Force la matérialisation
+        
+        return df_c_i
 
-            # OPTIMISATION CRITIQUE : Couper le lineage Spark (DAG)
-            # Sans localCheckpoint, la boucle while va créer un plan d'exécution infini 
-            # et causer un dépassement de mémoire (StackOverflowError).
-            df = df.localCheckpoint() 
+    def _update_caches(self, df_c_i: DataFrame, spark_session):
+        """
+        Étape 3B : Calcule les matrices globales de cache S^q et S^p via 
+        une agrégation distribuée massivement parallèle (treeAggregate + numpy).
+        """
+        print("--- Mise à jour des Caches Globaux S^q et S^p ---")
+        
+        K = self.K
+        
+        # ---------------------------------------------------------
+        # Calcul de S^q = sum(c_i * q_i * q_i^T)
+        # ---------------------------------------------------------
+        # Optimisation : Broadcast Join car df_c_i est très petit (N items, 2 colonnes)
+        q_with_c = self.Q.join(F.broadcast(df_c_i), on="item_idx", how="inner")
+        
+        # Définition des fonctions pour l'agrégation RDD
+        def seq_op_Sq(acc: np.ndarray, row) -> np.ndarray:
+            q_vec = np.array(row['factors'], dtype=np.float32)
+            c_i = row['c_i']
+            # Ajoute le produit externe pondéré à l'accumulateur local de la partition
+            return acc + c_i * np.outer(q_vec, q_vec)
             
-            current_count = df.count()
-            print(f"Itération {iteration}: {current_count} interactions restantes.")
-            iteration += 1
+        def comb_op(acc1: np.ndarray, acc2: np.ndarray) -> np.ndarray:
+            # Combine les accumulateurs des différentes partitions
+            return acc1 + acc2
 
-        return df
+        # treeAggregate est magique : il fait le reduce localement puis hiérarchiquement
+        # evitant un crash OOM sur le Driver si on a beaucoup de partitions.
+        Sq_local = q_with_c.rdd.treeAggregate(
+            zeroValue=np.zeros((K, K), dtype=np.float32),
+            seqOp=seq_op_Sq,
+            combOp=comb_op,
+            depth=3
+        )
 
-    def _create_integer_indices(self, df: DataFrame) -> DataFrame:
-        """
-        Convertit les identifiants textuels (UUID) en entiers contigus allant de 0 à N-1.
-        Ces entiers serviront d'indices pour accéder aux lignes des matrices latentes P et Q.
+        # ---------------------------------------------------------
+        # Calcul de S^p = P^T * P = sum(p_u * p_u^T)
+        # ---------------------------------------------------------
+        def seq_op_Sp(acc: np.ndarray, row) -> np.ndarray:
+            p_vec = np.array(row['factors'], dtype=np.float32)
+            return acc + np.outer(p_vec, p_vec)
 
-        Args:
-            df (DataFrame): DataFrame contenant les colonnes string "user_id" et "business_id".
+        Sp_local = self.P.rdd.treeAggregate(
+            zeroValue=np.zeros((K, K), dtype=np.float32),
+            seqOp=seq_op_Sp,
+            combOp=comb_op,
+            depth=3
+        )
 
-        Returns:
-            DataFrame: DataFrame avec les nouvelles colonnes "user_idx" et "item_idx" (entiers).
-        """
-        # Indexation des utilisateurs
-        user_indexer = StringIndexer(inputCol="user_id", outputCol="user_idx")
-        user_model = user_indexer.fit(df)
-        df = user_model.transform(df)
+        # ---------------------------------------------------------
+        # Libération des anciens broadcasts et création des nouveaux
+        # ---------------------------------------------------------
+        if self.broadcast_Sq is not None:
+            self.broadcast_Sq.unpersist()
+        if self.broadcast_Sp is not None:
+            self.broadcast_Sp.unpersist()
+            
+        self.broadcast_Sq = spark_session.sparkContext.broadcast(Sq_local)
+        self.broadcast_Sp = spark_session.sparkContext.broadcast(Sp_local)
         
-        # Indexation des items
-        item_indexer = StringIndexer(inputCol="business_id", outputCol="item_idx")
-        item_model = item_indexer.fit(df)
-        df = item_model.transform(df)
-
-        # Sauvegarde des modèles pour décoder les recommandations à la fin
-        self.indexer_models['user'] = user_model
-        self.indexer_models['item'] = item_model
-
-        # Cast en entier natif pour optimiser les jointures ultérieures
-        df = df.withColumn("user_idx", F.col("user_idx").cast("integer")) \
-               .withColumn("item_idx", F.col("item_idx").cast("integer"))
-
-        return df
-
-    def _compute_item_popularity(self, df: DataFrame) -> DataFrame:
-        """
-        Calcule la popularité relative (fréquence f_i) de chaque item dans le dataset[cite: 178, 180].
-        Formule : f_i = (Nombre d'interactions de l'item i) / (Nombre total d'interactions)[cite: 180].
-
-        Args:
-            df (DataFrame): DataFrame contenant la colonne "item_idx".
-
-        Returns:
-            DataFrame: DataFrame contenant "item_idx" et sa fréquence "f_i".
-        """
-        # Extraire le nombre total d'interactions sous forme scalaire (entier python)
-        total_interactions = df.count()
-        
-        # Grouper par item pour compter les interactions absolues
-        item_counts = df.groupBy("item_idx").agg(F.count("*").alias("count"))
-        
-        # Calculer la fréquence f_i
-        df_popularity = item_counts.withColumn("f_i", F.col("count") / F.lit(total_interactions))
-        
-        # On garde uniquement l'index et la popularité
-        df_popularity = df_popularity.select("item_idx", "f_i")
-        
-        # MISE EN CACHE : Ce petit DataFrame sera diffusé (broadcast) massivement plus tard
-        df_popularity.cache()
-        df_popularity.count() # Force la matérialisation du cache
-        
-        return df_popularity
-
-    def prepare_data(self, df_raw: DataFrame, min_interactions: int = 10) -> Tuple[DataFrame, DataFrame]:
-        """
-        Orchestrateur de l'Étape 1 : Nettoyage, indexation et préparation des données 
-        pour l'algorithme eALS[cite: 302, 344, 345].
-
-        Args:
-            df_raw (DataFrame): Le dataset brut (ex: yelp_academic_dataset_review).
-            min_interactions (int, optionnel): Seuil pour le filtrage k-core[cite: 345]. Défaut à 10[cite: 302].
-
-        Returns:
-            Tuple[DataFrame, DataFrame]: 
-                - df_final: Contient (user_idx, item_idx, rating=1.0)[cite: 110, 314].
-                - df_popularity: Contient (item_idx, f_i)[cite: 178, 180].
-        """
-        print("1. Sélection des colonnes...")
-        df_base = df_raw.select("user_id", "business_id")
-
-        print("2. Filtrage des utilisateurs et items inactifs...")
-        df_filtered = self._filter_interactions(df_base, min_interactions)
-
-        print("3. Indexation des IDs en entiers...")
-        df_indexed = self._create_integer_indices(df_filtered)
-
-        print("4. Calcul de la popularité des items (f_i)...")
-        df_popularity = self._compute_item_popularity(df_indexed)
-
-        print("5. Ajout du signal implicite (rating = 1.0)...")
-        # En recommandation implicite, chaque interaction observée vaut 1 [cite: 110, 314, 370]
-        df_final = df_indexed.withColumn("rating", F.lit(1.0).cast("float")) \
-                             .select("user_idx", "item_idx", "rating")
-        
-        # Ultime optimisation avant de passer à l'algorithme :
-        # Repartitionner par user_idx pour préparer le terrain de l'ALS par élément
-        df_final = df_final.repartition("user_idx")
-        df_final.cache()
-        df_final.count() # Force la matérialisation
-
-        print("--- Préparation des données terminée ! ---")
-        return df_final, df_popularity
+        print("-> Caches S^q et S^p calculés et diffusés avec succès.")
