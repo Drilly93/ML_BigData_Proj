@@ -112,68 +112,55 @@ class PySpark_eALS:
         df_c_i.count() # Force la matérialisation
         
         return df_c_i
-
+    
+    
     def _update_caches(self, df_c_i: DataFrame, spark_session):
-        """
-        Étape 3B : Calcule les matrices globales de cache S^q et S^p via 
-        une agrégation distribuée massivement parallèle (treeAggregate + numpy).
-        """
         print("--- Mise à jour des Caches Globaux S^q et S^p ---")
-        
         K = self.K
         
-        # ---------------------------------------------------------
-        # Calcul de S^q = sum(c_i * q_i * q_i^T)
-        # ---------------------------------------------------------
-        # Optimisation : Broadcast Join car df_c_i est très petit (N items, 2 colonnes)
+        # 1. S^q avec mapPartitions
         q_with_c = self.Q.join(F.broadcast(df_c_i), on="item_idx", how="inner")
         
-        # Définition des fonctions pour l'agrégation RDD
-        def seq_op_Sq(acc: np.ndarray, row) -> np.ndarray:
-            q_vec = np.array(row['factors'], dtype=np.float32)
-            c_i = row['c_i']
-            # Ajoute le produit externe pondéré à l'accumulateur local de la partition
-            return acc + c_i * np.outer(q_vec, q_vec)
+        def compute_Sq_partition(iterator):
+            import numpy as np
+            # Initialise l'accumulateur local pour cette partition
+            local_Sq = np.zeros((K, K), dtype=np.float32)
             
-        def comb_op(acc1: np.ndarray, acc2: np.ndarray) -> np.ndarray:
-            # Combine les accumulateurs des différentes partitions
-            return acc1 + acc2
+            # Traite toutes les lignes de la partition en une seule boucle locale
+            for row in iterator:
+                q_vec = np.array(row['factors'], dtype=np.float32)
+                c_i = row['c_i']
+                local_Sq += c_i * np.outer(q_vec, q_vec)
+                
+            # Renvoie le résultat final de la partition
+            yield local_Sq
 
-        # treeAggregate est magique : il fait le reduce localement puis hiérarchiquement
-        # evitant un crash OOM sur le Driver si on a beaucoup de partitions.
-        Sq_local = q_with_c.rdd.treeAggregate(
-            zeroValue=np.zeros((K, K), dtype=np.float32),
-            seqOp=seq_op_Sq,
-            combOp=comb_op,
-            depth=3
-        )
+        # On fait le calcul par partition, puis on somme les (ex: 8) petites matrices résultantes
+        Sq_matrices = q_with_c.rdd.mapPartitions(compute_Sq_partition).collect()
+        Sq_final = sum(Sq_matrices) if Sq_matrices else np.zeros((K, K), dtype=np.float32)
 
-        # ---------------------------------------------------------
-        # Calcul de S^p = P^T * P = sum(p_u * p_u^T)
-        # ---------------------------------------------------------
-        def seq_op_Sp(acc: np.ndarray, row) -> np.ndarray:
-            p_vec = np.array(row['factors'], dtype=np.float32)
-            return acc + np.outer(p_vec, p_vec)
+        # 2. S^p avec mapPartitions
+        def compute_Sp_partition(iterator):
+            import numpy as np
+            local_Sp = np.zeros((K, K), dtype=np.float32)
+            for row in iterator:
+                p_vec = np.array(row['factors'], dtype=np.float32)
+                local_Sp += np.outer(p_vec, p_vec)
+            yield local_Sp
 
-        Sp_local = self.P.rdd.treeAggregate(
-            zeroValue=np.zeros((K, K), dtype=np.float32),
-            seqOp=seq_op_Sp,
-            combOp=comb_op,
-            depth=3
-        )
+        Sp_matrices = self.P.rdd.mapPartitions(compute_Sp_partition).collect()
+        Sp_final = sum(Sp_matrices) if Sp_matrices else np.zeros((K, K), dtype=np.float32)
 
-        # ---------------------------------------------------------
-        # Libération des anciens broadcasts et création des nouveaux
-        # ---------------------------------------------------------
+        # 3. Broadcast
         if self.broadcast_Sq is not None:
             self.broadcast_Sq.unpersist()
         if self.broadcast_Sp is not None:
             self.broadcast_Sp.unpersist()
             
-        self.broadcast_Sq = spark_session.sparkContext.broadcast(Sq_local)
-        self.broadcast_Sp = spark_session.sparkContext.broadcast(Sp_local)
+        self.broadcast_Sq = spark_session.sparkContext.broadcast(Sq_final)
+        self.broadcast_Sp = spark_session.sparkContext.broadcast(Sp_final)
         
-        print("-> Caches S^q et S^p calculés et diffusés avec succès.")
+        print("-> Caches calculés à la vitesse NumPy et diffusés.")
 
 
     def _update_P(self, df_interactions: DataFrame, df_c_i: DataFrame, spark) -> DataFrame:

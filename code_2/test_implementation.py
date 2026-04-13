@@ -15,7 +15,7 @@ def run_test():
         .master("local[*]") \
         .config("spark.driver.memory", "4g") \
         .getOrCreate()
-
+    spark.conf.set("spark.sql.shuffle.partitions", "8")
     # CRITIQUE : Définir un dossier pour les localCheckpoints
     # Sur Windows, utilise un chemin comme "C:/tmp/checkpoints"
     checkpoint_dir = "/tmp/spark_checkpoints"
