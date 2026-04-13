@@ -1,3 +1,11 @@
+import os
+import sys
+
+# Force PySpark à utiliser l'exécutable Python de l'environnement virtuel actuel
+os.environ['PYSPARK_PYTHON'] = sys.executable
+os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
+
+
 from pyspark.sql import DataFrame
 import pyspark.sql.functions as F
 from pyspark.ml.feature import StringIndexer, StringIndexerModel

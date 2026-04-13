@@ -1,0 +1,14 @@
+# Noyau de calcul distribué
+pyspark==3.5.1
+
+# Dépendance pour la communication Python-Java (souvent installée avec pyspark)
+py4j==0.10.9.7
+
+# Manipulation de matrices et calcul numérique (utile pour l'eALS)
+numpy>=1.24.0
+
+# Inspection locale des données (pour le débugging)
+pandas>=2.0.0
+
+# Optionnel : Gestion des variables d'environnement si tu veux éviter de les coder en dur
+python-dotenv
