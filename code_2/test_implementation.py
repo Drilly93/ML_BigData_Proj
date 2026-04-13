@@ -112,5 +112,19 @@ def run_test():
     print(f"Shape de S^q : {Sq_matrix.shape}") # Devrait afficher (3, 3) car K=3
     print(f"Shape de S^p : {Sp_matrix.shape}")
 
+    print("\n--- ÉTAPE 2, 3 et 4 : Entraînement eALS ---")
+    
+    # Pour le test, mets peu d'itérations (ex: 3) et K petit (ex: 8) pour que ça tourne vite.
+    eals_model = PySpark_eALS(K=8, max_iter=3)
+    
+    # Lancement du moteur !
+    eals_model.fit(df_interactions, df_popularity, spark)
+    
+    print("\n--- RÉSULTATS FINAUX ---")
+    print("Vecteurs Utilisateurs entraînés :")
+    eals_model.P.show(5, truncate=False)
+    
+    print("Vecteurs Items entraînés :")
+    eals_model.Q.show(5, truncate=False)
 if __name__ == "__main__":
     run_test()

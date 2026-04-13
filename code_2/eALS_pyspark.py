@@ -3,6 +3,9 @@ from pyspark.sql import DataFrame
 import pyspark.sql.functions as F
 from typing import Tuple
 from pyspark.broadcast import Broadcast
+import pyspark.sql.types as T
+
+
 
 class PySpark_eALS:
     """
@@ -32,8 +35,8 @@ class PySpark_eALS:
         # Réservation de l'espace pour les futures matrices latentes distribuées
         self.P: DataFrame = None  # Matrice des utilisateurs
         self.Q: DataFrame = None  # Matrice des items
-        broadcast_Sq: Broadcast = None
-        broadcast_Sp: Broadcast = None
+        self.broadcast_Sq = None
+        self.broadcast_Sp = None
     def init_latent_factors(self, df_interactions: DataFrame) -> Tuple[DataFrame, DataFrame]:
         """
         Génère les matrices P et Q initiales à partir de la matrice d'interactions.
@@ -171,3 +174,188 @@ class PySpark_eALS:
         self.broadcast_Sp = spark_session.sparkContext.broadcast(Sp_local)
         
         print("-> Caches S^q et S^p calculés et diffusés avec succès.")
+
+
+    def _update_P(self, df_interactions: DataFrame, df_c_i: DataFrame, spark) -> DataFrame:
+        """
+        Met à jour la matrice latente des Utilisateurs (P) élément par élément.
+        """
+        print("-> Mise à jour de P (Utilisateurs)...")
+        
+        # 1. PRÉPARATION SPARK SQL (Ultra rapide pour les jointures)
+        # On regroupe toutes les infos (q_i, c_i, rating) nécessaires pour chaque utilisateur
+        df_joined = df_interactions.join(self.Q, on="item_idx", how="inner") \
+                                   .join(F.broadcast(df_c_i), on="item_idx", how="inner")
+        
+        # On crée une liste de "Structs" par utilisateur pour traiter tout en une fois
+        df_grouped = df_joined.groupBy("user_idx").agg(
+            F.collect_list(F.struct("rating", "factors", "c_i")).alias("interactions")
+        )
+
+        # Extraction des hyperparamètres pour le RDD
+        K = self.K
+        lambda_reg = self.lambda_reg
+        Sq_bc = self.broadcast_Sq
+
+        # 2. CALCUL NUMPY (Exécuté localement sur chaque cœur CPU du cluster)
+        def process_user(row):
+            import numpy as np # Import nécessaire sur les workers
+            user_idx = row.user_idx
+            interactions = row.interactions
+            Sq = Sq_bc.value
+            
+            p_u = np.zeros(K, dtype=np.float32)
+            num_interactions = len(interactions)
+            r_hat = np.zeros(num_interactions, dtype=np.float32) # Prédiction en cours
+            
+            if num_interactions > 0:
+                # OPTIMISATION EXTRÊME : Vectorisation NumPy
+                # Au lieu de faire des boucles Python sur les interactions, on crée des matrices
+                Q_mat = np.array([inter.factors for inter in interactions], dtype=np.float32)
+                ratings = np.array([inter.rating for inter in interactions], dtype=np.float32)
+                weights = 1.0 - np.array([inter.c_i for inter in interactions], dtype=np.float32)
+            else:
+                return (user_idx, p_u.tolist())
+
+            # Boucle eALS : Mise à jour dimension par dimension
+            for f in range(K):
+                old_val = p_u[f]
+                
+                # Partie 1 : Espace négatif (via le cache global Sq)
+                # Astuce mathématique : On soustrait l'ancienne valeur pour ne pas s'inclure soi-même
+                numerator = -(np.dot(p_u, Sq[:, f]) - old_val * Sq[f, f])
+                denominator = Sq[f, f] + lambda_reg
+                
+                # Partie 2 : Espace positif (les interactions observées)
+                if num_interactions > 0:
+                    q_f = Q_mat[:, f] # Colonne de la dimension f pour tous les items de l'user
+                    
+                    # On retire l'influence de la dimension actuelle de la prédiction globale
+                    r_hat_f = r_hat - old_val * q_f
+                    
+                    # On ajoute l'influence des vraies interactions
+                    numerator += np.sum((ratings - weights * r_hat_f) * q_f)
+                    denominator += np.sum(weights * (q_f ** 2))
+                
+                # Mise à jour exacte
+                p_u[f] = numerator / denominator
+                
+                # On met à jour la prédiction pour la prochaine dimension
+                if num_interactions > 0:
+                    r_hat = r_hat_f + p_u[f] * q_f
+                    
+            return (user_idx, p_u.tolist())
+
+        # 3. RETOUR À SPARK
+        schema = T.StructType([
+            T.StructField("user_idx", T.IntegerType(), False),
+            T.StructField("factors", T.ArrayType(T.FloatType()), False)
+        ])
+        
+        new_P = spark.createDataFrame(df_grouped.rdd.map(process_user), schema)
+        return new_P.repartition("user_idx")
+
+    def _update_Q(self, df_interactions: DataFrame, df_c_i: DataFrame, spark) -> DataFrame:
+        """
+        Met à jour la matrice latente des Items (Q) élément par élément.
+        Symétrique à P, mais attention : la confiance c_i est fixe pour un item !
+        """
+        print("-> Mise à jour de Q (Items)...")
+        
+        # Jointure avec P (Utilisateurs)
+        df_joined = df_interactions.join(self.P, on="user_idx", how="inner")
+        
+        df_grouped = df_joined.groupBy("item_idx").agg(
+            F.collect_list(F.struct("rating", "factors")).alias("interactions")
+        )
+        # On rajoute c_i à l'item
+        df_grouped = df_grouped.join(F.broadcast(df_c_i), on="item_idx", how="inner")
+
+        K = self.K
+        lambda_reg = self.lambda_reg
+        Sp_bc = self.broadcast_Sp
+
+        def process_item(row):
+            import numpy as np
+            item_idx = row.item_idx
+            c_i = row.c_i
+            interactions = row.interactions
+            Sp = Sp_bc.value
+            
+            q_i = np.zeros(K, dtype=np.float32)
+            num_interactions = len(interactions)
+            r_hat = np.zeros(num_interactions, dtype=np.float32)
+            
+            if num_interactions > 0:
+                P_mat = np.array([inter.factors for inter in interactions], dtype=np.float32)
+                ratings = np.array([inter.rating for inter in interactions], dtype=np.float32)
+                weights = 1.0 - c_i 
+            else:
+                return (item_idx, q_i.tolist())
+
+            for f in range(K):
+                old_val = q_i[f]
+                # Attention : Pour l'item, le cache Sp est multiplié par c_i (Équation 13)
+                numerator = -c_i * (np.dot(q_i, Sp[:, f]) - old_val * Sp[f, f])
+                denominator = c_i * Sp[f, f] + lambda_reg
+                
+                if num_interactions > 0:
+                    p_f = P_mat[:, f]
+                    r_hat_f = r_hat - old_val * p_f
+                    numerator += np.sum((ratings - weights * r_hat_f) * p_f)
+                    denominator += np.sum(weights * (p_f ** 2))
+                
+                q_i[f] = numerator / denominator
+                
+                if num_interactions > 0:
+                    r_hat = r_hat_f + q_i[f] * p_f
+                    
+            return (item_idx, q_i.tolist())
+
+        schema = T.StructType([
+            T.StructField("item_idx", T.IntegerType(), False),
+            T.StructField("factors", T.ArrayType(T.FloatType()), False)
+        ])
+        
+        new_Q = spark.createDataFrame(df_grouped.rdd.map(process_item), schema)
+        return new_Q.repartition("item_idx")
+
+    def fit(self, df_interactions: DataFrame, df_popularity: DataFrame, spark):
+        """
+        Entraîne le modèle eALS en utilisant l'alternance (ALS) avec gestion du Checkpointing.
+        """
+        print(f"\n====== DÉBUT DE L'ENTRAÎNEMENT eALS ({self.max_iter} Itérations) ======")
+        
+        # 1. Initialisation des poids c_i et des matrices P et Q
+        df_c_i = self._compute_item_confidences(df_popularity)
+        self.init_latent_factors(df_interactions)
+        
+        # 2. Boucle principale Alternating Least Squares
+        for iteration in range(1, self.max_iter + 1):
+            print(f"\n--- [Itération {iteration}/{self.max_iter}] ---")
+            
+            # --- UPDATE UTILISATEURS ---
+            self._update_caches(df_c_i, spark) # Met à jour S^q et S^p
+            new_P = self._update_P(df_interactions, df_c_i, spark)
+            
+            # CHECKPOINTING VITAL : Coupe le graphe d'exécution pour éviter les MemoryError
+            new_P = new_P.localCheckpoint()
+            new_P.count() # Force l'évaluation
+            
+            # Libère l'ancienne matrice de la RAM
+            self.P.unpersist()
+            self.P = new_P
+
+            # --- UPDATE ITEMS ---
+            self._update_caches(df_c_i, spark) # Recalcul requis car P vient de changer !
+            new_Q = self._update_Q(df_interactions, df_c_i, spark)
+            
+            new_Q = new_Q.localCheckpoint()
+            new_Q.count()
+            
+            self.Q.unpersist()
+            self.Q = new_Q
+            
+            print(f"Itération {iteration} complétée avec succès.")
+
+        print("====== ENTRAÎNEMENT TERMINÉ ======")
