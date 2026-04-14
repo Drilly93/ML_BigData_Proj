@@ -32,6 +32,8 @@ class ImplicitDataPreprocessor:
     def _filter_interactions(self, df: DataFrame, min_interactions: int) -> DataFrame:
         """
         Filtre itérativement (k-core) pour retirer les utilisateurs et items sous le seuil d'activité.
+        - Input: DataFrame (user, item), min_interactions (int)
+        - Output: DataFrame filtré ne contenant que des entités actives.
         """
         df.cache()
         current_count = df.count()
@@ -65,6 +67,8 @@ class ImplicitDataPreprocessor:
     def _create_integer_indices(self, df: DataFrame) -> DataFrame:
         """
         Convertit les identifiants textuels en indices entiers contigus (0 à N-1).
+        - Input: DataFrame avec colonnes originales (strings/ids).
+        - Output: DataFrame avec nouvelles colonnes 'user_idx' et 'item_idx' (int).
         """
         user_indexer = StringIndexer(inputCol=self.user_col, outputCol="user_idx")
         user_model = user_indexer.fit(df)
@@ -85,6 +89,8 @@ class ImplicitDataPreprocessor:
     def _compute_item_popularity(self, df: DataFrame) -> DataFrame:
         """
         Calcule la fréquence f_i de chaque item pour le modèle eALS.
+        - Input: DataFrame indexé.
+        - Output: DataFrame (item_idx, f_i) où f_i est la fréquence relative.
         """
         total_interactions = df.count()
         
@@ -99,6 +105,8 @@ class ImplicitDataPreprocessor:
     def transform(self, df_raw: DataFrame, min_interactions: int = 10) -> Tuple[DataFrame, DataFrame]:
         """
         Exécute la pipeline complète de transformation.
+        - Input: DataFrame brut, seuil min_interactions.
+        - Output: Tuple (df_final_interactions, df_item_popularity).
         """
         df_base = df_raw.select(self.user_col, self.item_col)
         df_filtered = self._filter_interactions(df_base, min_interactions)
